@@ -267,11 +267,14 @@ class NetworkXStorage(BaseGraphStorage):
         )
         nx.write_graphml(graph, file_name)
 
+    # 获取最大连通子图
     @staticmethod
     def stable_largest_connected_component(graph: nx.Graph) -> nx.Graph:
         """Refer to https://github.com/microsoft/graphrag/index/graph/utils/stable_lcc.py
         Return the largest connected component of the graph, with nodes and edges sorted in a stable way.
         """
+        
+        # 最大的连通子图
         from graspologic.utils import largest_connected_component
 
         graph = graph.copy()
@@ -287,10 +290,12 @@ class NetworkXStorage(BaseGraphStorage):
         """
         fixed_graph = nx.DiGraph() if graph.is_directed() else nx.Graph()
 
+        # 图中所有nodes
         sorted_nodes = graph.nodes(data=True)
         sorted_nodes = sorted(sorted_nodes, key=lambda x: x[0])
-
         fixed_graph.add_nodes_from(sorted_nodes)
+        
+        # 图中所有edge
         edges = list(graph.edges(data=True))
 
         if not graph.is_directed():
@@ -387,33 +392,48 @@ class NetworkXStorage(BaseGraphStorage):
         )
         max_num_ids = 0
         levels = defaultdict(set)
+        
+        # 遍历图中所有node
         for node_id, node_data in self._graph.nodes(data=True):
             if "clusters" not in node_data:
                 continue
+            
+            # 获取node的聚类信息
             clusters = json.loads(node_data["clusters"])
+            
+            # 获取node上面的边
             this_node_edges = self._graph.edges(node_id)
 
+            # 对于node所属的多个层次的社区
             for cluster in clusters:
                 level = cluster["level"]
                 cluster_key = str(cluster["cluster"])
+                # 每个层次有哪些社区
                 levels[level].add(cluster_key)
+                # results是要返回的，按社区为key组织
                 results[cluster_key]["level"] = level
                 results[cluster_key]["title"] = f"Cluster {cluster_key}"
                 results[cluster_key]["nodes"].add(node_id)
                 results[cluster_key]["edges"].update(
                     [tuple(sorted(e)) for e in this_node_edges]
                 )
+                # 这个社区牵扯到的所有chunks
                 results[cluster_key]["chunk_ids"].update(
                     node_data["source_id"].split(GRAPH_FIELD_SEP)
                 )
+                # 各个社区关联的最多chunk数量
                 max_num_ids = max(max_num_ids, len(results[cluster_key]["chunk_ids"]))
 
         ordered_levels = sorted(levels.keys())
+        # 将嵌套的社区父子关系还原出来
         for i, curr_level in enumerate(ordered_levels[:-1]):
             next_level = ordered_levels[i + 1]
+            # 当前层次(更粗，更大)
             this_level_comms = levels[curr_level]
+            # 下一个层次（更细，更小)
             next_level_comms = levels[next_level]
             # compute the sub-communities by nodes intersection
+            # 将社区间的父子关系构建出来
             for comm in this_level_comms:
                 results[comm]["sub_communities"] = [
                     c
@@ -421,28 +441,35 @@ class NetworkXStorage(BaseGraphStorage):
                     if results[c]["nodes"].issubset(results[comm]["nodes"])
                 ]
 
+        # 返回各个社群信息
         for k, v in results.items():
             v["edges"] = list(v["edges"])
             v["edges"] = [list(e) for e in v["edges"]]
             v["nodes"] = list(v["nodes"])
             v["chunk_ids"] = list(v["chunk_ids"])
-            v["occurrence"] = len(v["chunk_ids"]) / max_num_ids
+            v["occurrence"] = len(v["chunk_ids"]) / max_num_ids # 体现这个社区的chunk内容规模在所有社群中的排名
         return dict(results)
 
     def _cluster_data_to_subgraphs(self, cluster_data: dict[str, list[dict[str, str]]]):
         for node_id, clusters in cluster_data.items():
             self._graph.nodes[node_id]["clusters"] = json.dumps(clusters)
 
+    # 这里是跑leiden图聚类算法
     async def _leiden_clustering(self):
+        # 层次化社区聚类算法leiden
         from graspologic.partition import hierarchical_leiden
 
+        # 获取最大连通子图
         graph = NetworkXStorage.stable_largest_connected_component(self._graph)
+        
+        # 执行层次聚类算法
         community_mapping = hierarchical_leiden(
             graph,
             max_cluster_size=self.global_config["max_graph_cluster_size"],
             random_seed=self.global_config["graph_cluster_seed"],
         )
 
+        # 得到每个graph node所属的N个不同level层次和其聚类ID
         node_communities: dict[str, list[dict[str, str]]] = defaultdict(list)
         __levels = defaultdict(set)
         for partition in community_mapping:
@@ -451,11 +478,11 @@ class NetworkXStorage(BaseGraphStorage):
             node_communities[partition.node].append(
                 {"level": level_key, "cluster": cluster_id}
             )
-            __levels[level_key].add(cluster_id)
+            __levels[level_key].add(cluster_id) # 每一层有几个聚类社区
         node_communities = dict(node_communities)
         __levels = {k: len(v) for k, v in __levels.items()}
         logger.info(f"Each level has communities: {dict(__levels)}")
-        self._cluster_data_to_subgraphs(node_communities)
+        self._cluster_data_to_subgraphs(node_communities)   # 计算每个node属于哪个几个社群，把属性刷到graph中的Node身上
 
     async def embed_nodes(self, algorithm: str) -> tuple[np.ndarray, list[str]]:
         if algorithm not in self._node_embed_algorithms:

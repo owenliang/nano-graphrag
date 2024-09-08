@@ -58,10 +58,13 @@ async def _handle_entity_relation_summary(
     llm_max_tokens = global_config["cheap_model_max_token_size"]
     tiktoken_model_name = global_config["tiktoken_model_name"]
     summary_max_tokens = global_config["entity_summary_to_max_tokens"]
-
+    
+    # 字数不多则不需要做summary
     tokens = encode_string_by_tiktoken(description, model_name=tiktoken_model_name)
     if len(tokens) < summary_max_tokens:  # No need for summary
         return description
+    
+    # 需要走LLM总结一下
     prompt_template = PROMPTS["summarize_entity_descriptions"]
     use_description = decode_tokens_by_tiktoken(
         tokens[:llm_max_tokens], model_name=tiktoken_model_name
@@ -130,6 +133,7 @@ async def _merge_nodes_then_upsert(
     already_source_ids = []
     already_description = []
 
+    # 从graph中查询entity node
     already_node = await knwoledge_graph_inst.get_node(entity_name)
     if already_node is not None:
         already_entitiy_types.append(already_node["entity_type"])
@@ -138,6 +142,7 @@ async def _merge_nodes_then_upsert(
         )
         already_description.append(already_node["description"])
 
+    # 实体类型统计，取次数最多的作为entity_type
     entity_type = sorted(
         Counter(
             [dp["entity_type"] for dp in nodes_data] + already_entitiy_types
@@ -145,15 +150,20 @@ async def _merge_nodes_then_upsert(
         key=lambda x: x[1],
         reverse=True,
     )[0][0]
+    
+    # 合并所有的描述
     description = GRAPH_FIELD_SEP.join(
         sorted(set([dp["description"] for dp in nodes_data] + already_description))
     )
+    # 来自哪些chunk
     source_id = GRAPH_FIELD_SEP.join(
         set([dp["source_id"] for dp in nodes_data] + already_source_ids)
     )
+    # 总结所有的描述成1个简短的描述
     description = await _handle_entity_relation_summary(
         entity_name, description, global_config
     )
+    # 生成Node，插入graph
     node_data = dict(
         entity_type=entity_type,
         description=description,
@@ -185,13 +195,17 @@ async def _merge_edges_then_upsert(
         )
         already_description.append(already_edge["description"])
 
+    # 边的权重累加到一起
     weight = sum([dp["weight"] for dp in edges_data] + already_weights)
+    # 边的描述汇总到一起
     description = GRAPH_FIELD_SEP.join(
         sorted(set([dp["description"] for dp in edges_data] + already_description))
     )
+    # 来源chunk汇总
     source_id = GRAPH_FIELD_SEP.join(
         set([dp["source_id"] for dp in edges_data] + already_source_ids)
     )
+    # 边的两端node如果不在graph中，那么插入这俩node，但是node的实体类型是UNKNOWN
     for need_insert_id in [src_id, tgt_id]:
         if not (await knwoledge_graph_inst.has_node(need_insert_id)):
             await knwoledge_graph_inst.upsert_node(
@@ -202,9 +216,11 @@ async def _merge_edges_then_upsert(
                     "entity_type": '"UNKNOWN"',
                 },
             )
+    # 边描述总结
     description = await _handle_entity_relation_summary(
         (src_id, tgt_id), description, global_config
     )
+    # 插入一条edge到graph
     await knwoledge_graph_inst.upsert_edge(
         src_id,
         tgt_id,
@@ -216,9 +232,10 @@ async def _merge_edges_then_upsert(
     )
 
 
+# 传进来一堆chunk，构建一个知识图谱
 async def extract_entities(
     chunks: dict[str, TextChunkSchema],
-    knwoledge_graph_inst: BaseGraphStorage,
+    knwoledge_graph_inst: BaseGraphStorage, # 这是知识图谱
     entity_vdb: BaseVectorStorage,
     global_config: dict,
 ) -> Union[BaseGraphStorage, None]:
@@ -227,6 +244,7 @@ async def extract_entities(
 
     ordered_chunks = list(chunks.items())
 
+    # 一堆提示词，不知道做什么的
     entity_extract_prompt = PROMPTS["entity_extraction"]
     context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
@@ -241,55 +259,74 @@ async def extract_entities(
     already_entities = 0
     already_relations = 0
 
+    # 从1个chunk中提取实体和关系
     async def _process_single_content(chunk_key_dp: tuple[str, TextChunkSchema]):
         nonlocal already_processed, already_entities, already_relations
         chunk_key = chunk_key_dp[0]
         chunk_dp = chunk_key_dp[1]
         content = chunk_dp["content"]
+        
+        # 输入chunk，通过PE提取所有的实体（名字，类型，描述），以及实体之间的连线（from实体，to实体，描述，强弱打分）
         hint_prompt = entity_extract_prompt.format(**context_base, input_text=content)
         final_result = await use_llm_func(hint_prompt)
 
+        # 将本轮问答作为历史对话
         history = pack_user_ass_to_openai_messages(hint_prompt, final_result)
+        
+        # 多来几轮，强迫LLM继续尝试提取实体和关系
         for now_glean_index in range(entity_extract_max_gleaning):
+            # 再次LLM调用提取
             glean_result = await use_llm_func(continue_prompt, history_messages=history)
 
+            # 历史对话
             history += pack_user_ass_to_openai_messages(continue_prompt, glean_result)
-            final_result += glean_result
+            final_result += glean_result # 积累所有实体和关系
             if now_glean_index == entity_extract_max_gleaning - 1:
                 break
-
+            
+            # 反问LLM是否还值得继续提取呢？
             if_loop_result: str = await use_llm_func(
                 if_loop_prompt, history_messages=history
             )
             if_loop_result = if_loop_result.strip().strip('"').strip("'").lower()
-            if if_loop_result != "yes":
+            if if_loop_result != "yes": # 提取殆尽，提前离开
                 break
-
+        
+        # 解析出LLM返回的每个node或edge
+        # 每一行是##分割，结束符是 "<|COMPLETE|>"
         records = split_string_by_multi_markers(
             final_result,
             [context_base["record_delimiter"], context_base["completion_delimiter"]],
         )
 
+        # 数据格式：
+        # ("entity"{tuple_delimiter}"Sam Rivera"{tuple_delimiter}"person"{tuple_delimiter}"Sam Rivera is a member of a team working on communicating with an unknown intelligence, showing a mix of awe and anxiety."){record_delimiter}
         maybe_nodes = defaultdict(list)
         maybe_edges = defaultdict(list)
         for record in records:
+            # 提取()内的部分
             record = re.search(r"\((.*)\)", record)
             if record is None:
                 continue
             record = record.group(1)
+            # 用"<|>"分割每个字段
             record_attributes = split_string_by_multi_markers(
                 record, [context_base["tuple_delimiter"]]
             )
+            # 看是否为entity
             if_entities = await _handle_single_entity_extraction(
                 record_attributes, chunk_key
             )
+            # entity放到entity_name下面，追加存储
             if if_entities is not None:
                 maybe_nodes[if_entities["entity_name"]].append(if_entities)
                 continue
-
+            
+            # 看是否为edge
             if_relation = await _handle_single_relationship_extraction(
                 record_attributes, chunk_key
             )
+            # edge放到(src_entity,target_entity)下面，追加存储
             if if_relation is not None:
                 maybe_edges[(if_relation["src_id"], if_relation["tgt_id"])].append(
                     if_relation
@@ -308,24 +345,31 @@ async def extract_entities(
         return dict(maybe_nodes), dict(maybe_edges)
 
     # use_llm_func is wrapped in ascynio.Semaphore, limiting max_async callings
+    # 并发处理：每个chunk提取node和edge
     results = await asyncio.gather(
         *[_process_single_content(c) for c in ordered_chunks]
     )
     print()  # clear the progress bar
     maybe_nodes = defaultdict(list)
     maybe_edges = defaultdict(list)
-    for m_nodes, m_edges in results:
+    
+     # 遍历每一个chunk的nodes,edges结果，收集点和边
+    for m_nodes, m_edges in results:   
         for k, v in m_nodes.items():
-            maybe_nodes[k].extend(v)
+            maybe_nodes[k].extend(v)  
         for k, v in m_edges.items():
             # it's undirected graph
-            maybe_edges[tuple(sorted(k))].extend(v)
+            maybe_edges[tuple(sorted(k))].extend(v) # (src,tgt)内部排序一下，统一顺序
+    
+    # 所有点插入graph
     all_entities_data = await asyncio.gather(
         *[
-            _merge_nodes_then_upsert(k, v, knwoledge_graph_inst, global_config)
+            _merge_nodes_then_upsert(k, v, knwoledge_graph_inst, global_config) # 这里同1个entity的N条记录会归成1个entity
             for k, v in maybe_nodes.items()
         ]
     )
+    
+    # 所有遍插入graph
     await asyncio.gather(
         *[
             _merge_edges_then_upsert(k[0], k[1], v, knwoledge_graph_inst, global_config)
@@ -335,6 +379,8 @@ async def extract_entities(
     if not len(all_entities_data):
         logger.warning("Didn't extract any entities, maybe your LLM is not working")
         return None
+    
+    # 将实体信息插入entity向量库
     if entity_vdb is not None:
         data_for_vdb = {
             compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
@@ -353,9 +399,11 @@ def _pack_single_community_by_sub_communities(
     already_reports: dict[str, CommunitySchema],
 ) -> tuple[str, int]:
     # TODO
+    # 找出所有的子社区
     all_sub_communities = [
         already_reports[k] for k in community["sub_communities"] if k in already_reports
     ]
+    # 在子社区层次中，取chunk多的社区
     all_sub_communities = sorted(
         all_sub_communities, key=lambda x: x["occurrence"], reverse=True
     )
@@ -364,10 +412,32 @@ def _pack_single_community_by_sub_communities(
         key=lambda x: x["report_string"],
         max_token_size=max_token_size,
     )
+    
+    '''
+    社区报告长相：
+        {{
+        "title": <report_title>,
+        "summary": <executive_summary>,
+        "rating": <impact_severity_rating>,
+        "rating_explanation": <rating_explanation>,
+        "findings": [
+            {{
+                "summary":<insight_1_summary>,
+                "explanation": <insight_1_explanation>
+            }},
+            {{
+                "summary":<insight_2_summary>,
+                "explanation": <insight_2_explanation>
+            }}
+            ...
+        ]
+    }}
+    '''
+    # 下属子社区的报告列表，形成一个CSV格式的大报告
     sub_fields = ["id", "report", "rating", "importance"]
     sub_communities_describe = list_of_list_to_csv(
-        [sub_fields]
-        + [
+        [sub_fields]    # 表头
+        + [ # 每一行
             [
                 i,
                 c["report_string"],
@@ -377,6 +447,8 @@ def _pack_single_community_by_sub_communities(
             for i, c in enumerate(may_trun_all_sub_communities)
         ]
     )
+    
+    # 牵扯到的子社区，每一个社区的nodes和edges清单
     already_nodes = []
     already_edges = []
     for c in may_trun_all_sub_communities:
@@ -399,15 +471,19 @@ async def _pack_single_community_describe(
 ) -> str:
     nodes_in_order = sorted(community["nodes"])
     edges_in_order = sorted(community["edges"], key=lambda x: x[0] + x[1])
-
+    
+    # 这个社区的所有node
     nodes_data = await asyncio.gather(
         *[knwoledge_graph_inst.get_node(n) for n in nodes_in_order]
     )
+    # 这个社区的所有edge
     edges_data = await asyncio.gather(
         *[knwoledge_graph_inst.get_edge(src, tgt) for src, tgt in edges_in_order]
     )
     node_fields = ["id", "entity", "type", "description", "degree"]
     edge_fields = ["id", "source", "target", "description", "rank"]
+    
+    # 社区里node太多,太多description需要控制总量,保留部分node给PE用
     nodes_list_data = [
         [
             i,
@@ -422,6 +498,8 @@ async def _pack_single_community_describe(
     nodes_may_truncate_list_data = truncate_list_by_token_size(
         nodes_list_data, key=lambda x: x[3], max_token_size=max_token_size // 2
     )
+    
+    # 社区里edge太多,太多description需要控制总量,保留部分edge给PE用
     edges_list_data = [
         [
             i,
@@ -449,10 +527,13 @@ async def _pack_single_community_describe(
     force_to_use_sub_communities = global_config["addon_params"].get(
         "force_to_use_sub_communities", False
     )
+    
+    # 如果直接对当前社区做报告的prompt太长，那么就基于子社区的报告直接生成
     if need_to_use_sub_communities or force_to_use_sub_communities:
         logger.debug(
             f"Community {community['title']} exceeds the limit or you set force_to_use_sub_communities to True, using its sub-communities"
         )
+        # 子社区报告汇总
         report_describe, report_size, contain_nodes, contain_edges = (
             _pack_single_community_by_sub_communities(
                 community, max_token_size, already_reports
@@ -470,6 +551,8 @@ async def _pack_single_community_describe(
         report_include_edges_list_data = [
             e for e in edges_list_data if (e[1], e[2]) in contain_edges
         ]
+        
+        # 子社区node和edge汇总
         # if report size is bigger than max_token_size, nodes and edges are []
         nodes_may_truncate_list_data = truncate_list_by_token_size(
             report_exclude_nodes_list_data + report_include_nodes_list_data,
@@ -519,6 +602,7 @@ def _community_report_json_to_str(parsed_output: dict) -> str:
     return f"# {title}\n\n{summary}\n\n{report_sections}"
 
 
+# 生成社区的报告
 async def generate_community_report(
     community_report_kv: BaseKVStorage[CommunitySchema],
     knwoledge_graph_inst: BaseGraphStorage,
@@ -530,18 +614,22 @@ async def generate_community_report(
         "convert_response_to_json_func"
     ]
 
+    # 这个PE用来给某个社区生成报告用的
     community_report_prompt = PROMPTS["community_report"]
 
+    # 整理整个graph中聚类出来的各个社区，后续会分别对每个社区进行报告总结
     communities_schema = await knwoledge_graph_inst.community_schema()
     community_keys, community_values = list(communities_schema.keys()), list(
         communities_schema.values()
     )
     already_processed = 0
 
+    # 为某个社区生成报告
     async def _form_single_community_report(
         community: SingleCommunitySchema, already_reports: dict[str, CommunitySchema]
     ):
         nonlocal already_processed
+        # 生成PE
         describe = await _pack_single_community_describe(
             knwoledge_graph_inst,
             community,
@@ -549,9 +637,11 @@ async def generate_community_report(
             already_reports=already_reports,
             global_config=global_config,
         )
+        # 调用LLM拿到报告
         prompt = community_report_prompt.format(input_text=describe)
         response = await use_llm_func(prompt, **llm_extra_kwargs)
-
+        
+        # 结果是个JSON
         data = use_string_json_convert_func(response)
         already_processed += 1
         now_ticks = PROMPTS["process_tickers"][
@@ -567,7 +657,10 @@ async def generate_community_report(
     levels = sorted(set([c["level"] for c in community_values]), reverse=True)
     logger.info(f"Generating by levels: {levels}")
     community_datas = {}
+    
+    # 从最深的层次开始生成报告，不断向上生成更高层次的报告
     for level in levels:
+        # 找出该层所有的社区
         this_level_community_keys, this_level_community_values = zip(
             *[
                 (k, v)
@@ -575,6 +668,8 @@ async def generate_community_report(
                 if v["level"] == level
             ]
         )
+        
+        # 为该层的每个社区生成报告
         this_level_communities_reports = await asyncio.gather(
             *[
                 _form_single_community_report(c, community_datas)

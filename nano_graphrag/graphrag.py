@@ -272,14 +272,16 @@ class GraphRAG:
                 await self.chunks_vdb.upsert(inserting_chunks)
 
             # TODO: no incremental update for communities now, so just drop all
+            # 社群分析清空，重新算
             await self.community_reports.drop()
 
             # ---------- extract/summary entity and upsert to graph
+            # 提取实体，总结实体，插入图谱
             logger.info("[Entity Extraction]...")
             maybe_new_kg = await extract_entities(
                 inserting_chunks,
                 knwoledge_graph_inst=self.chunk_entity_relation_graph,
-                entity_vdb=self.entities_vdb,
+                entity_vdb=self.entities_vdb,   # 实体的向量库
                 global_config=asdict(self),
             )
             if maybe_new_kg is None:
@@ -288,9 +290,11 @@ class GraphRAG:
             self.chunk_entity_relation_graph = maybe_new_kg
             # ---------- update clusterings of graph
             logger.info("[Community Report]...")
+            # 社区聚类，调用的是_storage.py中的NetworkXStorage.clustering方法
             await self.chunk_entity_relation_graph.clustering(
                 self.graph_cluster_algorithm
             )
+            # 生成社区报告，社区id->社区报告
             await generate_community_report(
                 self.community_reports, self.chunk_entity_relation_graph, asdict(self)
             )
