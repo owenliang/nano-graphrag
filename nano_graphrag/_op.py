@@ -369,7 +369,7 @@ async def extract_entities(
         ]
     )
     
-    # 所有遍插入graph
+    # 所有边插入graph
     await asyncio.gather(
         *[
             _merge_edges_then_upsert(k[0], k[1], v, knwoledge_graph_inst, global_config)
@@ -617,6 +617,7 @@ async def generate_community_report(
     # 这个PE用来给某个社区生成报告用的
     community_report_prompt = PROMPTS["community_report"]
 
+    # 重要！！！！
     # 整理整个graph中聚类出来的各个社区，后续会分别对每个社区进行报告总结
     communities_schema = await knwoledge_graph_inst.community_schema()
     community_keys, community_values = list(communities_schema.keys()), list(
@@ -629,7 +630,7 @@ async def generate_community_report(
         community: SingleCommunitySchema, already_reports: dict[str, CommunitySchema]
     ):
         nonlocal already_processed
-        # 生成PE
+        # 生成PE所需的上下文信息，主要是社区内的点和边，也可能包含子社区的report
         describe = await _pack_single_community_describe(
             knwoledge_graph_inst,
             community,
@@ -656,7 +657,7 @@ async def generate_community_report(
 
     levels = sorted(set([c["level"] for c in community_values]), reverse=True)
     logger.info(f"Generating by levels: {levels}")
-    community_datas = {}
+    community_datas = {}    # 这个是社区为key，对应{report_string, report_json}报告。 子社区的报告可以用于父社区的报告生成。
     
     # 从最深的层次开始生成报告，不断向上生成更高层次的报告
     for level in levels:

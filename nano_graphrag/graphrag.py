@@ -242,6 +242,7 @@ class GraphRAG:
             logger.info(f"[New Docs] inserting {len(new_docs)} docs")
 
             # ---------- chunking
+            # 文档切片
             inserting_chunks = {}
             for doc_key, doc in new_docs.items():
                 chunks = {
@@ -290,7 +291,7 @@ class GraphRAG:
             self.chunk_entity_relation_graph = maybe_new_kg
             # ---------- update clusterings of graph
             logger.info("[Community Report]...")
-            # 社区聚类，调用的是_storage.py中的NetworkXStorage.clustering方法
+            # 社区聚类，调用的是_storage.py中的NetworkXStorage.clustering方法，给每个graph中的node打上聚类标识
             await self.chunk_entity_relation_graph.clustering(
                 self.graph_cluster_algorithm
             )
